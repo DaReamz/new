@@ -26,8 +26,36 @@ if (!guildedToken || !shapesApiKey || !shapeUsername) {
     process.exit(1);
 }
 
-// Initialize Guilded Client
-const client = new Client({ token: guildedToken });
+
+// Initialize Guilded Client with custom headers for official markdown support
+const client = new Client({ 
+    token: guildedToken,
+    // Add custom headers for all WebSocket and REST API requests
+    rest: {
+        headers: {
+            'x-guilded-bot-api-use-official-markdown': 'true'
+        }
+    },
+    ws: {
+        headers: {
+            'x-guilded-bot-api-use-official-markdown': 'true'
+        }
+    }
+});
+
+// Override the REST client's request method to ensure header is always included
+const originalRequest = client.rest.request;
+client.rest.request = function(options) {
+    // Ensure headers object exists
+    if (!options.headers) {
+        options.headers = {};
+    }
+    // Add the official markdown header to every request
+    options.headers['x-guilded-bot-api-use-official-markdown'] = 'true';
+    
+    console.log(`[REST API] Adding official markdown header to ${options.method} ${options.path}`);
+    return originalRequest.call(this, options);
+};
 
 // File path for storing active channels and known bots
 const channelsFilePath = './active_channels.json';
