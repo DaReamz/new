@@ -11,6 +11,7 @@ const shapeUsername = process.env.SHAPE_USERNAME;
 
 const SHAPES_API_BASE_URL = "https://api.shapes.inc/v1";
 const SHAPES_MODEL_NAME = `shapesinc/${shapeUsername}`;
+const GUILDED_API_BASE_URL = "https://www.guilded.gg/api/v1";
 
 // WHITELIST: Users that should ALWAYS be responded to (not considered bots)
 const WHITELISTED_USERS = new Set([
@@ -26,11 +27,9 @@ if (!guildedToken || !shapesApiKey || !shapeUsername) {
     process.exit(1);
 }
 
-
 // Initialize Guilded Client with custom headers for official markdown support
 const client = new Client({ 
     token: guildedToken,
-    // Add custom headers for all WebSocket and REST API requests
     rest: {
         headers: {
             'x-guilded-bot-api-use-official-markdown': 'true'
@@ -46,11 +45,9 @@ const client = new Client({
 // Override the REST client's request method to ensure header is always included
 const originalRequest = client.rest.request;
 client.rest.request = function(options) {
-    // Ensure headers object exists
     if (!options.headers) {
         options.headers = {};
     }
-    // Add the official markdown header to every request
     options.headers['x-guilded-bot-api-use-official-markdown'] = 'true';
     
     console.log(`[REST API] Adding official markdown header to ${options.method} ${options.path}`);
@@ -71,6 +68,10 @@ let knownBots = new Set();
 const recentMessages = new Map(); // channelId -> Array of {userId, timestamp}
 const BOT_DETECTION_WINDOW = 30000; // 30 seconds
 const MAX_MESSAGES_PER_USER = 5; // Max messages per user in the window
+
+// Cache for signed URLs to avoid repeated requests
+const signedUrlCache = new Map(); // url -> {signedUrl, expires}
+const SIGNED_URL_CACHE_DURATION = 4 * 60 * 1000; // 4 minutes (before 5 minute expiry)
 
 // --- Message Constants ---
 const START_MESSAGE_ACTIVATE = () => `🤖 Hello! I am now active for **${shapeUsername}** in this channel. All messages here will be forwarded.`;
@@ -158,7 +159,6 @@ function isWhitelistedUser(message) {
 }
 
 function isBot(message) {
-    // PRIORITY CHECK: If user is whitelisted, they are never considered a bot
     if (isWhitelistedUser(message)) {
         return false;
     }
@@ -167,13 +167,11 @@ function isBot(message) {
     const author = message.author;
     const content = message.content?.trim() || '';
     
-    // Check if user is already known to be a bot
     if (knownBots.has(userId)) {
         console.log(`[Bot Filter] Known bot detected: ${author?.name} (ID: ${userId})`);
         return true;
     }
     
-    // Check if message author is marked as bot type - most reliable indicator
     if (author?.type === "bot") {
         knownBots.add(userId);
         saveKnownBots();
@@ -181,17 +179,8 @@ function isBot(message) {
         return true;
     }
     
-    // Check for bot indicators in the message content
     const botIndicators = [
-        '🤖', // Bot emoji at start
-        '🔧', // Tool emoji
-        '⚙️', // Settings emoji
-        '🚀', // Rocket emoji (common in bot responses)
-        '✅', // Check mark (common in bot confirmations)
-        '❌', // X mark (common in bot errors)
-        '⚠️', // Warning emoji
-        '📊', // Chart emoji
-        '💡', // Lightbulb emoji
+        '🤖', '🔧', '⚙️', '🚀', '✅', '❌', '⚠️', '📊', '💡',
     ];
     
     if (botIndicators.some(indicator => content.startsWith(indicator))) {
@@ -201,18 +190,17 @@ function isBot(message) {
         return true;
     }
     
-    // Check for specific bot response patterns
     const botResponsePatterns = [
         /^(hello!? i am now active|i am already active|i am not active|i am no longer active)/i,
         /^(to activate me, please use|the command has been sent to)/i,
         /^(sorry, (?:the|there was))/i,
         /^(too many requests)/i,
         /^(oops, something went wrong)/i,
-        /^(\*\*\w+\*\* didn't provide)/i, // Pattern like "**username** didn't provide"
+        /^(\*\*\w+\*\* didn't provide)/i,
         /^\w+ has been (activated|deactivated|reset)/i,
         /^(processing|generating|thinking)/i,
         /^(error:|warning:|info:)/i,
-        /^\[.*\]/i, // Messages starting with brackets like [System]
+        /^\[.*\]/i,
     ];
     
     if (botResponsePatterns.some(pattern => pattern.test(content))) {
@@ -222,23 +210,12 @@ function isBot(message) {
         return true;
     }
     
-    // Check username patterns for bots
     const username = author?.name?.toLowerCase() || '';
     const displayName = author?.displayName?.toLowerCase() || '';
     
     const botNamePatterns = [
-        /bot$/,           // ends with "bot"
-        /^bot/,           // starts with "bot"
-        /-bot$/,          // ends with "-bot"
-        /_bot$/,          // ends with "_bot"
-        /ai$/,            // ends with "ai"
-        /^ai-/,           // starts with "ai-"
-        /assistant/,      // contains "assistant"
-        /helper/,         // contains "helper"
-        /service/,        // contains "service"
-        /automated/,      // contains "automated"
-        /system/,         // contains "system"
-        new RegExp(`^${shapeUsername.toLowerCase()}`, 'i'), // Starts with the shape username
+        /bot$/, /^bot/, /-bot$/, /_bot$/, /ai$/, /^ai-/, /assistant/, /helper/, /service/, /automated/, /system/,
+        new RegExp(`^${shapeUsername.toLowerCase()}`, 'i'),
     ];
     
     if (botNamePatterns.some(pattern => pattern.test(username) || pattern.test(displayName))) {
@@ -252,31 +229,23 @@ function isBot(message) {
 }
 
 function detectRapidFireBot(channelId, userId, message) {
-    // PRIORITY CHECK: If user is whitelisted, skip rapid-fire detection
     if (isWhitelistedUser(message)) {
         return false;
     }
     
     const now = Date.now();
     
-    // Initialize channel tracking if not exists
     if (!recentMessages.has(channelId)) {
         recentMessages.set(channelId, []);
     }
     
     const channelMessages = recentMessages.get(channelId);
-    
-    // Clean old messages outside the detection window
     const validMessages = channelMessages.filter(msg => now - msg.timestamp < BOT_DETECTION_WINDOW);
-    
-    // Count messages from this user
     const userMessages = validMessages.filter(msg => msg.userId === userId);
     
-    // Add current message
     validMessages.push({ userId, timestamp: now });
     recentMessages.set(channelId, validMessages);
     
-    // Check if user is sending too many messages
     if (userMessages.length >= MAX_MESSAGES_PER_USER) {
         knownBots.add(userId);
         saveKnownBots();
@@ -285,6 +254,88 @@ function detectRapidFireBot(channelId, userId, message) {
     }
     
     return false;
+}
+
+// NEW: Function to check if URL is a Guilded CDN URL
+function isGuildedCdnUrl(url) {
+    if (typeof url !== 'string') return false;
+    try {
+        const parsedUrl = new URL(url);
+        return parsedUrl.hostname.includes('guilded') && 
+               (parsedUrl.hostname.includes('cdn') || parsedUrl.pathname.includes('/asset/'));
+    } catch (e) {
+        return false;
+    }
+}
+
+// NEW: Function to request signed URLs from Guilded API
+async function getSignedUrls(urls) {
+    if (!urls || urls.length === 0) return {};
+    
+    // Filter to only Guilded CDN URLs
+    const guildedUrls = urls.filter(isGuildedCdnUrl);
+    if (guildedUrls.length === 0) return {};
+    
+    // Check cache first
+    const cachedUrls = {};
+    const uncachedUrls = [];
+    const now = Date.now();
+    
+    for (const url of guildedUrls) {
+        const cached = signedUrlCache.get(url);
+        if (cached && now < cached.expires) {
+            cachedUrls[url] = { signedUrl: cached.signedUrl };
+            console.log(`[Signed URL] Using cached signed URL for: ${url}`);
+        } else {
+            uncachedUrls.push(url);
+        }
+    }
+    
+    if (uncachedUrls.length === 0) {
+        return cachedUrls;
+    }
+    
+    try {
+        console.log(`[Signed URL] Requesting signed URLs for ${uncachedUrls.length} URLs`);
+        
+        const response = await axios.post(
+            `${GUILDED_API_BASE_URL}/url-signatures`,
+            { urls: uncachedUrls },
+            {
+                headers: {
+                    'Authorization': `Bearer ${guildedToken}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 10000
+            }
+        );
+        
+        if (response.data && response.data.urlSignatures) {
+            const signatures = response.data.urlSignatures;
+            const expires = now + SIGNED_URL_CACHE_DURATION;
+            
+            // Cache the signed URLs
+            for (const [originalUrl, signedUrl] of Object.entries(signatures)) {
+                signedUrlCache.set(originalUrl, { signedUrl, expires });
+                cachedUrls[originalUrl] = { signedUrl };
+            }
+            
+            console.log(`[Signed URL] Successfully obtained ${Object.keys(signatures).length} signed URLs`);
+        }
+        
+        return cachedUrls;
+    } catch (error) {
+        console.error('[Signed URL] Error requesting signed URLs:', error.response ? error.response.data : error.message);
+        
+        // Fallback: return original URLs for non-Guilded URLs
+        const fallback = {};
+        for (const url of urls) {
+            if (!isGuildedCdnUrl(url)) {
+                fallback[url] = { signedUrl: url };
+            }
+        }
+        return fallback;
+    }
 }
 
 function getMediaType(url) {
@@ -311,8 +362,6 @@ function extractImageUrls(text) {
     
     const imageUrls = [];
     const lines = text.split('\n');
-    
-    // URL regex pattern to match http/https URLs
     const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
     
     for (const line of lines) {
@@ -341,7 +390,8 @@ function extractImageUrls(text) {
     return [...new Set(imageUrls)]; // Remove duplicates
 }
 
-function formatShapeResponseForGuilded(shapeResponse) {
+// UPDATED: Format Shape response with signed URL support
+async function formatShapeResponseForGuilded(shapeResponse) {
     if (typeof shapeResponse !== 'string' || shapeResponse.trim() === "") {
         return { content: shapeResponse };
     }
@@ -350,19 +400,23 @@ function formatShapeResponseForGuilded(shapeResponse) {
     const imageUrls = extractImageUrls(shapeResponse);
     
     if (imageUrls.length === 0) {
-        // No images found, return as-is
         return { content: shapeResponse };
     }
 
-    // Create embeds for all found images
-    const embeds = imageUrls.map(url => ({ image: { url } }));
+    // Get signed URLs for all image URLs
+    const signedUrlMap = await getSignedUrls(imageUrls);
+    
+    // Create embeds using signed URLs where available
+    const embeds = imageUrls.map(url => {
+        const signedData = signedUrlMap[url];
+        const finalUrl = signedData ? signedData.signedUrl : url;
+        return { image: { url: finalUrl } };
+    });
     
     // Clean up the content by removing wrapped URLs that are now embedded
     let cleanedContent = shapeResponse;
     imageUrls.forEach(url => {
-        // Remove wrapped versions
         cleanedContent = cleanedContent.replace(new RegExp(`<${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}>`, 'g'), '');
-        // Also remove plain URLs if they're standalone on a line
         cleanedContent = cleanedContent.replace(new RegExp(`^${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'gm'), '');
     });
     
@@ -374,7 +428,6 @@ function formatShapeResponseForGuilded(shapeResponse) {
         .join('\n')
         .trim();
 
-    // Return appropriate format based on whether there's remaining content
     if (cleanedContent === "") {
         return { embeds };
     } else {
@@ -385,7 +438,6 @@ function formatShapeResponseForGuilded(shapeResponse) {
 async function sendMessageToShape(userId, channelId, content, guildId = null) {
     console.log(`[Shapes API] Sending message to ${SHAPES_MODEL_NAME}: User ${userId}, Channel ${channelId}, Guild ${guildId || 'N/A'}, Content: "${content}"`);
     try {
-        // Build headers with guild ID support
         const headers = {
             Authorization: `Bearer ${shapesApiKey}`,
             "Content-Type": "application/json",
@@ -393,12 +445,9 @@ async function sendMessageToShape(userId, channelId, content, guildId = null) {
             "X-Channel-Id": channelId,
         };
         
-        // Add guild ID if available
         if (guildId) {
             headers["X-Guild-Id"] = guildId;
             console.log(`[Shapes API] Adding Guild ID to headers: ${guildId}`);
-        } else {
-            console.log(`[Shapes API] No Guild ID available for this request`);
         }
 
         const response = await axios.post(
@@ -419,7 +468,6 @@ async function sendMessageToShape(userId, channelId, content, guildId = null) {
             
             console.log(`[Shapes API] Response received: "${shapeResponseContent}", isBot: ${isBot}`);
             
-            // If the response indicates this is from a bot, mark the user as a bot
             if (isBot) {
                 knownBots.add(userId);
                 saveKnownBots();
@@ -454,9 +502,7 @@ async function processShapeApiCommand(guildedMessage, guildedCommandName, baseSh
     const userId = guildedMessage.createdById;
     const guildId = guildedMessage.serverId || guildedMessage.guildId || null;
 
-    // Debug guild information
     console.log(`[Debug] Processing command /${guildedCommandName} - Guild/Server ID: ${guildId || 'NOT FOUND'}`);
-    console.log(`[Debug] Available message properties:`, Object.keys(guildedMessage));
 
     if (!activeChannels.has(channelId)) {
         await guildedMessage.reply(NOT_ACTIVE_MESSAGE());
@@ -485,7 +531,7 @@ async function processShapeApiCommand(guildedMessage, guildedCommandName, baseSh
         const shapeResponse = await sendMessageToShape(userId, channelId, fullShapeCommand, guildId);
 
         if (shapeResponse?.content?.trim() !== "") {
-            const replyPayload = formatShapeResponseForGuilded(shapeResponse.content);
+            const replyPayload = await formatShapeResponseForGuilded(shapeResponse.content);
             if (typeof replyPayload.content === 'string' && (replyPayload.content.startsWith("Sorry,") || replyPayload.content.startsWith("Too many requests") || replyPayload.content.startsWith("The Shape service"))) {
                 await guildedMessage.reply(replyPayload.content);
             } else {
@@ -525,9 +571,7 @@ client.on("messageCreated", async (message) => {
     const author = message.author;
     const guildId = message.serverId || message.guildId || null;
     
-    // Enhanced debugging for guild information
     console.log(`[Message Debug] Received message from: ${author?.name} (ID: ${userId}), Type: ${author?.type}, Guild/Server ID: ${guildId || 'NOT FOUND'}, Content: "${message.content?.substring(0, 50)}..."`);
-    console.log(`[Debug] Available message properties:`, Object.keys(message));
     
     // CRITICAL: Ignore messages from this bot itself
     if (userId === client.user?.id) {
@@ -535,24 +579,20 @@ client.on("messageCreated", async (message) => {
         return;
     }
     
-    // Check if user is whitelisted - if so, skip all bot detection
     const isUserWhitelisted = isWhitelistedUser(message);
     
     if (!isUserWhitelisted) {
-        // CRITICAL: Check for rapid-fire bot behavior before other checks
         if (detectRapidFireBot(channelId, userId, message)) {
             console.log(`[Bot Filter] *** BLOCKING RAPID-FIRE BOT *** ${author?.name} (ID: ${userId})`);
             return;
         }
         
-        // CRITICAL: Ignore messages from known bots
         if (isBot(message)) {
             console.log(`[Bot Filter] *** BLOCKING MESSAGE FROM BOT *** ${author?.name} (ID: ${userId})`);
             return;
         }
     }
     
-    // Ignore empty messages
     if (!message.content?.trim()) {
         console.log(`[Bot Filter] Ignoring empty message from: ${author?.name}`);
         return;
@@ -601,6 +641,34 @@ client.on("messageCreated", async (message) => {
             saveKnownBots();
             return message.reply("🤖 Known bots list has been cleared.");
         }
+
+        // Only process other commands in active channels
+        if (!activeChannels.has(channelId)) {
+            return message.reply(NOT_ACTIVE_MESSAGE());
+        }
+
+        // Shapes API commands
+        switch (lowerCaseCommand) {
+            case "reset":
+                return processShapeApiCommand(message, "reset", "!reset");
+            case "sleep":
+                return processShapeApiCommand(message, "sleep", "!sleep");
+            case "dashboard":
+                return processShapeApiCommand(message, "dashboard", "!dashboard");
+            case "info":
+                return processShapeApiCommand(message, "info", "!info");
+            case "web":
+                return processShapeApiCommand(message, "web", "!web", true, args);
+            case "help":
+                return processShapeApiCommand(message, "help", "!help");
+            case "imagine":
+                return processShapeApiCommand(message, "imagine", "!imagine", true, args);
+            case "wack":
+                return processShapeApiCommand(message, "wack", "!wack");
+            default:
+                return;
+        }
+    }
 
         // Only process other commands in active channels
         if (!activeChannels.has(channelId)) {
