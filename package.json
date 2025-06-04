@@ -1,0 +1,21 @@
+{
+  "name": "guilded-shapes-bot",
+  "version": "1.0.0",
+  "description": "A Guilded bot that integrates with Shapes API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "guilded.js": "^0.20.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["guilded", "bot", "shapes", "api"],
+  "author": "Your Name",
+  "license": "MIT"
+}
